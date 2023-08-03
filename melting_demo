@@ -1,0 +1,724 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <malloc.h>
+#include <time.h>
+
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+
+#define tmax 	200000000
+#define eps     (1E-8)
+#define nn      1.0
+
+#define NX      512	
+#define NY      512
+#define LX      (1.0)
+#define LY      (1.0)
+#define Href    LX
+#define Q9      9
+#define Q5      5
+
+#define dx      (LX/(NX - 1))
+#define dy      (LY/(NY - 1))
+#define c      (10.0)
+#define dt      (dx/c)
+#define cs      sqrt(c*c/3.0)
+#define cs_g2   (c*c/3.0)
+#define cs_f2   (c*c/3.0)
+
+#define VOL_p   (0.02)
+#define CP_p    (383.0)
+#define CP_f    (4179.0)
+#define RHO_p   (8954.0)
+#define RHO_f   (997.0)
+#define K_p     (400.0)
+#define K_f(np) (np == 0 ? 0.613 : 0.613)
+#define BETA_p  (1.67*pow(10.0,(-5.0)))
+#define BETA_f  (21.0*pow(10.0,(-5.0)))
+
+#define Diam_f  (3.853124730842014e-10)
+#define Diam_p  (100e-9) 
+#define Miu_f   (0.000891)
+#define B_p     (1.0 - 34.87 * pow(1.0 * Diam_p / Diam_f,-0.3 ) * pow( VOL_p , 1.03 ))                     
+#define Miu_nf  (Miu_f / B_p)
+
+//***Effective of the thermal conductiveity***
+#define Pr_f(np) (1.0 * CP_f * Miu_f / K_f(np)) 
+#define Ra_f    (100000)
+#define Ste_f   (0.50)
+#define HotTem  (303.0)
+#define ColdTem (293.0)
+#define DeltaK  (HotTem-ColdTem)                    
+#define AvgTem  (0.5 * (HotTem + ColdTem))
+#define Kb      (1.38066e-23)                                                        
+#define PI      (3.1415926)                                    
+#define AvgTem  (0.5 * (HotTem + ColdTem))     
+#define Tfr     (273.15)                                                                 
+#define Re(T)   (2.0 * RHO_f * Kb * (T * DeltaK + AvgTem) / (PI * Miu_f * Miu_f *Diam_p))   
+#define K_nf(T,np)   (K_f(np) * (1.0 + 4.4 * pow(Re(T),0.4) * pow(Pr_f(np), 0.66) * pow(((T * DeltaK + AvgTem) / Tfr),10.0) * pow((1.0*K_p/K_f(np)),0.03) * pow(VOL_p,0.66)))
+
+//***Effective density***
+#define RHO_nf  ((1.0-VOL_p) * RHO_f + VOL_p * RHO_p)
+
+//***Effective heat capacitance***
+#define C_p     ((1.0-VOL_p) * RHO_f * CP_f)
+#define D_p     (VOL_p * RHO_p * CP_p)
+#define CP_nf   ((C_p + D_p) / RHO_nf)
+
+//***Effective thermal expansion coefficient***
+#define E_p     ((1.0-VOL_p) * RHO_f * BETA_f)
+#define F_p     (VOL_p * RHO_p * BETA_p) 
+#define BETA_nf ((E_p + F_p) / RHO_nf)
+
+//***Temperature field parameters***
+#define Thot    (1.0)
+#define Tcold   (0.0)
+#define deltaT  (Thot - Tcold)
+#define Tref    Tcold			
+#define Tm      Tcold			
+#define	Tl      Tm		    
+#define Ts      Tm
+
+//***Parameter***
+#define G_p(T,np) ((Miu_nf * K_f(np) * CP_nf) / (Miu_f * K_nf(T,np) * CP_f))
+#define H_p1(np)  (RHO_nf * BETA_nf * K_f(np) * BETA_nf * CP_nf * Miu_f)
+#define H_p2(T,np)  (RHO_f * BETA_f * K_nf(T,np) * BETA_f * CP_f * Miu_nf)
+#define J_p(T,np) (H_p1(np) / H_p2(T,np))
+
+//***dimensionless number***
+#define Pr(T,np) ( G_p(T,np) * Pr_f(np))        
+#define Ra(T,np) ( J_p(T,np) * Ra_f)       
+#define Ma (0.03)
+
+#define g_beta          (Ma * Ma * cs_f2/Href/deltaT) 
+#define chi(T,np)       (Ma * cs * Href/qrt(Pr(T,np) * Ra(T,np)))  
+#define niu(T,np)       (Pr(T,np) * (pow(chi(T,np), (2.0-nn)) / pow(Href,(2.0-2.0 * nn)))) 
+
+#define alpha_f0(T)      chi(T,1)             
+#define alpha_s0(T)      chi(T,0)
+#define alpha_flag0      alpha_f0(0)
+#define undim_t         (alpha_f0(0) * dt/LX/LX)
+
+#define Cp_r            (1.0)
+#define	Cp_f0	        (1.0)                  
+#define	Cp_s0	        (Cp_f0 * Cp_r)
+#define Cpref           (2.0 * Cp_f0 * Cp_s0 / (Cp_f0+Cp_s0))
+#define Cp_flag0        (Cp_f0)
+
+#define rho_r           (1.0)
+#define rho_f0          (1.0)
+#define rho_s0          (rho_f0*rho_r)
+#define rho_flag0       (rho_f0*rho_r)
+
+#define	lambda_f0(T)    (alpha_f0(T) * rho_f0 * Cp_f0)    
+#define	lambda_s0(T)    (alpha_s0(T) * rho_s0 * Cp_s0)
+#define	lambda_flag0    (100 * alpha_flag0 * rho_flag0 * Cp_flag0)
+
+#define Lf              (Cp_f0 * deltaT/Ste_f)
+#define L               ((1.0-VOL_p) * (Lf * RHO_f) / RHO_nf)
+#define Hl              (Cp_f0 * Tl+1.0 * L)
+#define Hs              (Cp_s0 * Ts)
+
+#define tau_f(T,np)      (0.5 + niu(T,np) / (cs_f2 * dt))
+
+#define lambda(T,local) (local == 1 ? lambda_f0(T): local == 3 ? lambda_flag0: lambda_s0(T))
+#define Cp(local)	    (local == 1 ? Cp_f0: local == 3 ? Cp_flag0: Cp_s0)
+
+#define tau_a(T,local)  (lambda(T,local) / (rho_f0 * Cpref * dt * cs_g2) + 0.5)
+#define tau_s(T,local)  (tau_a(T,local) / (2.0 * tau_a(T,local) - 1.0))
+#define wa(T,local)     (1.0/2.0 * (1.0/tau_s(T,local) + 1.0/tau_a(T,local)))
+#define ws(T,local)     (1.0/2.0 * (1.0/tau_s(T,local) - 1.0/tau_a(T,local)))
+
+//***Thread allocation in GPU***
+#define N16 	16
+#define N1 	1          
+#define NX2  	(NX + N16 + N16)
+#define NY2 	(NY + N1 + N1)
+#define NXNY2   (NY2 * NX2)     
+//***Block***
+#define BX      16  
+#define BY      8
+
+//***Memory allocation in CPU***
+double f[Q9][NY2][NX2];
+double g[Q5][NY2][NX2];
+double Tem[NY2][NX2];
+double Fl[NY2][NX2];
+int   Interface[NY2][NX2];
+int   Flag[NY2][NX2];
+int   local[NY2][NX2];
+double RlxTime[NY2][NX2];
+double Nu_av, fl_av, Fo;
+double   sensheat , latheat , heat;
+double Nu[NX2];
+int   IF_area;
+int num;
+
+//***GPU***
+double *f_dev = 0, *f_post_dev = 0;
+double *g_dev = 0, *g_post_dev = 0;
+double *RlxTime_dev = 0;
+double *H_dev = 0;
+double *tem_dev = 0;
+double *fl_dev = 0;
+int *flag_dev = 0;
+int *Interface_dev = 0;
+//***Equilibrium distribution function***
+#define feq_f0(rho, ux, uy)  (rho * 4.0f/9.0f * (1.0f - 1.5f * (ux * ux + uy * uy)/(c * c)))
+#define feq_f1(rho, ux, uy)  (rho * 1.0f/9.0f * (1.0f + 3.0f * ux/c + 4.5f * ux * ux/(c * c) - 1.5f * (ux * ux + uy * uy)/(c * c)))
+#define feq_f2(rho, ux, uy)  (rho * 1.0f/9.0f * (1.0f + 3.0f * uy/c + 4.5f * uy * uy/(c * c) - 1.5f * (ux * ux + uy * uy)/(c * c)))
+#define feq_f3(rho, ux, uy)  (rho * 1.0f/9.0f * (1.0f - 3.0f * ux/c + 4.5f * ux * ux/(c * c) - 1.5f * (ux * ux + uy * uy)/(c * c)))
+#define feq_f4(rho, ux, uy)  (rho * 1.0f/9.0f * (1.0f - 3.0f * uy/c + 4.5f * uy * uy/(c * c) - 1.5f * (ux * ux + uy * uy)/(c * c)))
+#define feq_f5(rho, ux, uy)  (rho * 1.0f/36.0f * (1.0f + 3.0f * ( ux + uy)/c + 4.5f * ( ux + uy) * ( ux + uy)/(c * c) - 1.5f * (ux * ux + uy * uy)/(c * c)))
+#define feq_f6(rho, ux, uy)  (rho * 1.0f/36.0f * (1.0f + 3.0f * (-ux + uy)/c + 4.5f * (-ux + uy) * (-ux + uy)/(c * c) - 1.5f * (ux * ux + uy * uy)/(c * c)))
+#define feq_f7(rho, ux, uy)  (rho * 1.0f/36.0f * (1.0f + 3.0f * (-ux - uy)/c + 4.5f * (-ux - uy) * (-ux - uy)/(c * c) - 1.5f * (ux * ux + uy * uy)/(c * c)))
+#define feq_f8(rho, ux, uy)  (rho * 1.0f/36.0f * (1.0f + 3.0f * ( ux - uy)/c + 4.5f * ( ux - uy) * ( ux - uy)/(c * c) - 1.5f * (ux * ux + uy * uy)/(c * c)))
+#define RHO(y,x) (f[0][y][x] + f[1][y][x] + f[2][y][x] + f[3][y][x] + f[4][y][x] + f[5][y][x] + f[6][y][x] + f[7][y][x] + f[8][y][x])
+#define CalculateUx(y,x)  ((f[1][y][x] + f[5][y][x] + f[8][y][x] - f[3][y][x] - f[6][y][x] - f[7][y][x]) * c/RHO(y,x))
+#define CalculateUy(y,x)  ((f[2][y][x] + f[5][y][x] + f[6][y][x] - f[4][y][x] - f[7][y][x] - f[8][y][x]) * c/RHO(y,x))
+//***External force***
+#define Fx(tem)	(0.0)
+#define Fy(tem)	(g_beta * tem)
+#define Force_f0(ux,uy,tem)		(4.0/9.0 * (3.0 * (-ux * Fx(tem)-uy * Fy(tem)))/(c * c))
+#define Force_f1(ux,uy,tem)		(1.0/9.0 * (3.0 * ((c-ux) * Fx(tem)-uy * Fy(tem)) + 9.0 * (ux) * (Fx(tem)))/(c * c))
+#define Force_f2(ux,uy,tem)		(1.0/9.0 * (3.0 * (-ux * Fx(tem) + (c-uy) * Fy(tem)) + 9.0 * (uy) * (Fy(tem)))/(c * c))
+#define Force_f3(ux,uy,tem)		(1.0/9.0 * (3.0 * ((-c-ux) * Fx(tem) + (-uy) * Fy(tem)) + 9.0 * (-ux) * (-Fx(tem)))/(c * c))
+#define Force_f4(ux,uy,tem)		(1.0/9.0 * (3.0 * (-ux * Fx(tem) + (-c-uy) * Fy(tem)) + 9.0 * (-uy) * (-Fy(tem)))/(c * c))
+#define Force_f5(ux,uy,tem)		(1.0/36.0 * (3.0 * ((c-ux) * Fx(tem) + (c-uy) * Fy(tem)) + 9.0 * (ux + uy) * (Fx(tem) + Fy(tem)))/(c * c))
+#define Force_f6(ux,uy,tem)		(1.0/36.0 * (3.0 * ((-c-ux) * Fx(tem) + (c-uy) * Fy(tem)) + 9.0 * (-ux + uy) * (-Fx(tem) + Fy(tem)))/(c * c))
+#define Force_f7(ux,uy,tem)		(1.0/36.0 * (3.0 * ((-c-ux) * Fx(tem) + (-c-uy) * Fy(tem)) + 9.0 * (-ux-uy) * (-Fx(tem)-Fy(tem)))/(c * c))
+#define Force_f8(ux,uy,tem)		(1.0/36.0 * (3.0 * ((c-ux) * Fx(tem) + (-c-uy) * Fy(tem)) + 9.0 * (ux-uy) * (Fx(tem)-Fy(tem)))/(c * c))
+
+//***huang2015JCP***
+#define feq_h0(local,H,tem,ux,uy)	(H-Cpref * tem + 1.0/3.0 * Cpref * tem-1.0/2.0 * Cp(local) * tem * (ux * ux + uy * uy)/(c * c))
+#define feq_h1(local,H,tem,ux,uy)	(1.0/6.0 * Cpref * tem + 1.0/6.0 * Cp(local) * tem * (3.0 * ux/c + 4.5 * ux * ux/(c * c)-1.5 * (ux * ux + uy * uy)/(c * c)))
+#define feq_h2(local,H,tem,ux,uy)	(1.0/6.0 * Cpref * tem + 1.0/6.0 * Cp(local) * tem * (3.0 * uy/c + 4.5 * uy * uy/(c * c)-1.5 * (ux * ux + uy * uy)/(c * c)))
+#define feq_h3(local,H,tem,ux,uy)	(1.0/6.0 * Cpref * tem + 1.0/6.0 * Cp(local) * tem * (3.0 * (-ux)/c + 4.5 * ux * ux/(c * c)-1.5 * (ux * ux + uy * uy)/(c * c)))
+#define feq_h4(local,H,tem,ux,uy)	(1.0/6.0 * Cpref * tem + 1.0/6.0 * Cp(local) * tem * (3.0 * (-uy)/c + 4.5 * uy * uy/(c * c)-1.5 * (ux * ux + uy * uy)/(c * c)))
+#define CalculateH(y,x)     (g[0][y][x] + g[1][y][x] + g[2][y][x] + g[3][y][x] + g[4][y][x])
+
+#define PowerLaw(AbsRate, index,T,np) ((niu(T,np)) * pow((AbsRate + 0.000000000001), ((index - 1.0)/2.0)))
+
+void flag()
+{
+	int y, x;
+	num=0;
+/*
+	int y00, x00;
+	FILE *fppp;	
+	if ((fppp = fopen("flag_plate.dat", "r")) == NULL)
+	{
+		printf("Read Static file failed!\n");
+        return;
+	}
+	for (y = N1; y <= N1 + NY-1; y++)
+	{
+		for (x = N16; x <= N16 + NX - 1; x++)
+		{
+			fscanf(fppp, "%d\t%d\t%d\n", &y00, &x00, &Flag[y][x]);
+			if(Flag[y][x]!=0) {Flag[y][x]=0;}
+			num = num + 1;
+		}
+	}
+	fclose(fppp);
+	*/
+	for (y = N1; y <= N1 + NY-1; y++)
+	{
+		for (x = N16; x <= N16 + NX - 1; x++)
+		{
+			Flag[y][x]=0;
+			num = num + 1;
+		}
+	}	
+	printf("num=%d\n",num);	
+}
+
+void LB_init()
+{
+	printf("tau_f=%lf\n L=%lf\n Hl=%lf\n Hs=%lf\n niu=%lf\n g_beta=%lf\n Pr=%lf\n cs_f2=%lf\n deltaT=%lf\n LX=%lf\n",tau_f(0,0),L,Hl,Hs,niu(0,0),g_beta,Pr(0,0),cs_f2,deltaT,LX);
+	printf("lambda_s=%lf\n lambda_f=%lf\n",lambda(0,0),lambda(0,2));
+	printf("undim_t=%lf\n",undim_t);
+	printf("Ra = %lf \n", Ra(0,0));
+	
+	int x,y;
+	double rho,ux,uy,h;
+	rho=1.0;
+	ux=0.0;
+	uy=0.0;
+	
+	for(y=1;y<=NY;++y)
+	{
+		for(x=N16;x<=NX + N16-1;++x)
+		{
+			f[0][y][x] = feq_f0(rho,ux,uy);
+			f[1][y][x] = feq_f1(rho,ux,uy);
+			f[2][y][x] = feq_f2(rho,ux,uy);
+			f[3][y][x] = feq_f3(rho,ux,uy);
+			f[4][y][x] = feq_f4(rho,ux,uy);
+			f[5][y][x] = feq_f5(rho,ux,uy);
+			f[6][y][x] = feq_f6(rho,ux,uy);
+			f[7][y][x] = feq_f7(rho,ux,uy);
+			f[8][y][x] = feq_f8(rho,ux,uy);
+			RlxTime[y][x] = tau_f(0,0);
+			Tem[y][x]=Tcold;
+			Fl[y][x]=0.0;
+            Interface[y][x]=0;
+			if(x == N16)
+			{
+				Tem[y][x]=Thot;
+				Fl[y][x]=1.0;
+			}
+			if(x == NX + N16-1)Tem[y][x]=Tcold;
+			local[y][x] = Flag[y][x];
+            if(Flag[y][x] == 0) local[y][x] = Fl[y][x];
+			h=Cp(Fl[y][x]) * Tem[y][x] + L * Fl[y][x];
+			
+			g[0][y][x] = feq_h0(local[y][x],h,Tem[y][x],ux,uy);
+			g[1][y][x] = feq_h1(local[y][x],h,Tem[y][x],ux,uy);
+			g[2][y][x] = feq_h2(local[y][x],h,Tem[y][x],ux,uy);
+			g[3][y][x] = feq_h3(local[y][x],h,Tem[y][x],ux,uy);
+			g[4][y][x] = feq_h4(local[y][x],h,Tem[y][x],ux,uy);
+		}
+	}
+	
+}
+
+//***Parameters deal***
+void Parameters_file()
+{
+    FILE *fp;
+    char filename[30];
+    sprintf(filename, "%s", "Parameters.txt");
+    fp = fopen(filename, "w");
+    fprintf(fp, "dx = %f \n", dx);
+    fprintf(fp, "dt = %f \n", dt);
+    fprintf(fp, "Ra = %f \n", Ra(0.0,1));
+    fprintf(fp, "Pr = %f \n", Pr(0.0,1));
+    fprintf(fp, "Ste  = %f \n", Ste_f);
+    fprintf(fp, "chi = %f K_nf(1) = %f RHO_nf = %f CP_nf = %f\n", chi(0.0,1),K_nf(0.0,1),RHO_nf,CP_nf);
+    fprintf(fp, "lambda(0.0) = %f \n", lambda(0.0,0));
+    fprintf(fp, "lambda(2.0) = %f \n", lambda(0.0,2));
+    fprintf(fp, "K_p/K_f = %f \n", K_p/K_f(0));
+    fprintf(fp, "niu = %f \n", niu(0.0,1));  
+    fprintf(fp, "gbeta = %f \n", g_beta);
+    fprintf(fp, "tau_f = %f \n", tau_f(0.0,1));    
+    fprintf(fp, "tau_a(1) = %f \n", tau_a(0.0,1));
+    fclose(fp);
+}
+
+__global__ void Evolution_flow(double *f_dev, double *f_post_dev, double *tem_dev, double *fl_dev,int *flag_dev, double *RlxTime_dev)
+{
+	int x, y, k;
+	double ux, uy, rho;
+	int ThreadNeary, ThreadNearx, kNear;
+	double uxNear, uyNear;
+    double TAU,wf,Cxx, Cxy, Cyx, Cyy, AbsRate_s;
+
+	__shared__ double f[Q9][BY][BX];
+    __shared__ double RlxTime[BY][BX]; 
+
+	x = N16 + blockIdx.x * BX + threadIdx.x;
+	y = 1 + blockIdx.y * BY + threadIdx.y;
+	k = NX2 * y + x;
+
+	RlxTime[threadIdx.y][threadIdx.x] = RlxTime_dev[k];
+	f[0][threadIdx.y][threadIdx.x] = f_dev[k + 0];
+	f[1][threadIdx.y][threadIdx.x] = f_dev[k + 1 * NXNY2];
+	f[2][threadIdx.y][threadIdx.x] = f_dev[k + 2 * NXNY2];
+	f[3][threadIdx.y][threadIdx.x] = f_dev[k + 3 * NXNY2];
+	f[4][threadIdx.y][threadIdx.x] = f_dev[k + 4 * NXNY2];
+	f[5][threadIdx.y][threadIdx.x] = f_dev[k + 5 * NXNY2];
+	f[6][threadIdx.y][threadIdx.x] = f_dev[k + 6 * NXNY2];
+	f[7][threadIdx.y][threadIdx.x] = f_dev[k + 7 * NXNY2];
+	f[8][threadIdx.y][threadIdx.x] = f_dev[k + 8 * NXNY2];
+	__syncthreads();
+
+	if(x == N16||x == NX + N16-1||y == 1||y == NY)
+	{
+		ThreadNeary = threadIdx.y;
+		ThreadNearx = threadIdx.x;
+		uy = ux = 0.0;
+		if(x == N16){++ThreadNearx;kNear=k+1;}
+		if(x == NX + N16-1){--ThreadNearx;kNear=k - 1;}
+		if(y == 1){++ThreadNeary;kNear=k + NX2;}
+		if(y == NY){--ThreadNeary;kNear=k-NX2;}
+		
+		uxNear=CalculateUx(ThreadNeary,ThreadNearx);
+		uyNear=CalculateUy(ThreadNeary,ThreadNearx) + 0.5 * g_beta * (tem_dev[kNear] - Tref) * dt;
+		rho=RHO(ThreadNeary,ThreadNearx);
+		
+		f[0][threadIdx.y][threadIdx.x] = feq_f0(rho, ux, uy) + f[0][ThreadNeary][ThreadNearx] - feq_f0(rho, uxNear, uyNear);
+		f[1][threadIdx.y][threadIdx.x] = feq_f1(rho, ux, uy) + f[1][ThreadNeary][ThreadNearx] - feq_f1(rho, uxNear, uyNear);
+		f[2][threadIdx.y][threadIdx.x] = feq_f2(rho, ux, uy) + f[2][ThreadNeary][ThreadNearx] - feq_f2(rho, uxNear, uyNear);
+		f[3][threadIdx.y][threadIdx.x] = feq_f3(rho, ux, uy) + f[3][ThreadNeary][ThreadNearx] - feq_f3(rho, uxNear, uyNear);
+		f[4][threadIdx.y][threadIdx.x] = feq_f4(rho, ux, uy) + f[4][ThreadNeary][ThreadNearx] - feq_f4(rho, uxNear, uyNear);
+		f[5][threadIdx.y][threadIdx.x] = feq_f5(rho, ux, uy) + f[5][ThreadNeary][ThreadNearx] - feq_f5(rho, uxNear, uyNear);
+		f[6][threadIdx.y][threadIdx.x] = feq_f6(rho, ux, uy) + f[6][ThreadNeary][ThreadNearx] - feq_f6(rho, uxNear, uyNear);
+		f[7][threadIdx.y][threadIdx.x] = feq_f7(rho, ux, uy) + f[7][ThreadNeary][ThreadNearx] - feq_f7(rho, uxNear, uyNear);
+		f[8][threadIdx.y][threadIdx.x] = feq_f8(rho, ux, uy) + f[8][ThreadNeary][ThreadNearx] - feq_f8(rho, uxNear, uyNear);
+	}
+
+	ux=CalculateUx(threadIdx.y,threadIdx.x);
+	uy=CalculateUy(threadIdx.y,threadIdx.x) + 0.5 * g_beta * (tem_dev[k] - Tref) * dt;
+	rho=RHO(threadIdx.y,threadIdx.x);
+	__syncthreads();
+	
+  TAU = RlxTime[threadIdx.y][threadIdx.x];
+
+  Cxx = f[1][threadIdx.y][threadIdx.x] + f[3][threadIdx.y][threadIdx.x] + f[5][threadIdx.y][threadIdx.x] + f[6][threadIdx.y][threadIdx.x] + f[7][threadIdx.y][threadIdx.x] + f[8][threadIdx.y][threadIdx.x]-(feq_f1(rho,ux,uy) + feq_f3(rho,ux,uy) + feq_f5(rho,ux,uy) + feq_f6(rho,ux,uy) + feq_f7(rho,ux,uy) + feq_f8(rho,ux,uy)) + 0.5 * dt * rho * (Fx(tem_dev[k]) * ux + ux * Fx(tem_dev[k]))/(c * c);
+  Cxy = f[5][threadIdx.y][threadIdx.x]-f[6][threadIdx.y][threadIdx.x] + f[7][threadIdx.y][threadIdx.x]-f[8][threadIdx.y][threadIdx.x]
+  -(feq_f5(rho,ux,uy)-feq_f6(rho,ux,uy) + feq_f7(rho,ux,uy)-feq_f8(rho,ux,uy)) + 0.5 * dt * rho * (Fx(tem_dev[k]) * uy + ux * Fy(tem_dev[k]))/(c * c);
+  Cyx = f[5][threadIdx.y][threadIdx.x]-f[6][threadIdx.y][threadIdx.x] + f[7][threadIdx.y][threadIdx.x]-f[8][threadIdx.y][threadIdx.x]
+  -(feq_f5(rho,ux,uy)-feq_f6(rho,ux,uy) + feq_f7(rho,ux,uy)-feq_f8(rho,ux,uy)) + 0.5 * dt * rho * (Fy(tem_dev[k]) * ux + uy * Fx(tem_dev[k]))/(c * c);
+  Cyy = f[2][threadIdx.y][threadIdx.x] + f[4][threadIdx.y][threadIdx.x] + f[5][threadIdx.y][threadIdx.x] + f[6][threadIdx.y][threadIdx.x] + f[7][threadIdx.y][threadIdx.x] + f[8][threadIdx.y][threadIdx.x]-(feq_f2(rho,ux,uy) + feq_f4(rho,ux,uy) + feq_f5(rho,ux,uy) + feq_f6(rho,ux,uy) + feq_f7(rho,ux,uy) + feq_f8(rho,ux,uy)) + 0.5 * dt * rho * (Fy(tem_dev[k]) * uy + uy * Fy(tem_dev[k]))/(c * c);
+
+  AbsRate_s = 9.0 * (Cxx * Cxx + Cxy * Cxy + Cyx * Cyx + Cyy * Cyy)/(2.0 * TAU * TAU * dt * dt);   /*  Attention here  */
+  RlxTime_dev[k] = PowerLaw(AbsRate_s, nn,tem_dev[k],fl_dev[k]) /(cs_f2 * dt) + 0.5;
+  wf = 1.0 / RlxTime_dev[k];
+  
+  if(fl_dev[k] == 0.0){ux=uy=0.0;}
+	if(x == N16||x == NX + N16-1||y == 1||y == NY){ux=uy=0.0;}
+  if(x == N16) tem_dev[k]=Thot;
+
+  double B = (1.0 - fl_dev[k]) * (RlxTime_dev[k] - 0.5) / (fl_dev[k] + RlxTime_dev[k] - 0.5);
+
+  f_post_dev[k     +                 0] = (1.0 - (1.0 - B) * wf) * f[0][threadIdx.y][threadIdx.x] + (1.0 - B) * wf * feq_f0(rho, ux, uy) + B * (f[0][threadIdx.y][threadIdx.x] - f[0][threadIdx.y][threadIdx.x] + feq_f0(rho, 0.0, 0.0) - feq_f0(rho, 0.0, 0.0)) + (1.0 - 0.5 * wf) * dt * Force_f0(ux, uy, tem_dev[k]);
+
+  f_post_dev[k + 1 +         1 * NXNY2] = (1.0 - (1.0 - B) * wf) * f[1][threadIdx.y][threadIdx.x] + (1.0 - B) * wf * feq_f1(rho, ux, uy) + B * (f[3][threadIdx.y][threadIdx.x] - f[1][threadIdx.y][threadIdx.x] + feq_f1(rho, 0.0, 0.0) - feq_f3(rho, 0.0, 0.0)) + (1.0 - 0.5 * wf) * dt * Force_f1(ux, uy, tem_dev[k]);
+  f_post_dev[k +       NX2 + 2 * NXNY2] = (1.0 - (1.0 - B) * wf) * f[2][threadIdx.y][threadIdx.x] + (1.0 - B) * wf * feq_f2(rho, ux, uy) + B * (f[4][threadIdx.y][threadIdx.x] - f[2][threadIdx.y][threadIdx.x] + feq_f2(rho, 0.0, 0.0) - feq_f4(rho, 0.0, 0.0)) + (1.0 - 0.5 * wf) * dt * Force_f2(ux, uy, tem_dev[k]);
+  f_post_dev[k - 1 +         3 * NXNY2] = (1.0 - (1.0 - B) * wf) * f[3][threadIdx.y][threadIdx.x] + (1.0 - B) * wf * feq_f3(rho, ux, uy) + B * (f[1][threadIdx.y][threadIdx.x] - f[3][threadIdx.y][threadIdx.x] + feq_f3(rho, 0.0, 0.0) - feq_f1(rho, 0.0, 0.0)) + (1.0 - 0.5 * wf) * dt * Force_f3(ux, uy, tem_dev[k]);
+  f_post_dev[k -       NX2 + 4 * NXNY2] = (1.0 - (1.0 - B) * wf) * f[4][threadIdx.y][threadIdx.x] + (1.0 - B) * wf * feq_f4(rho, ux, uy) + B * (f[2][threadIdx.y][threadIdx.x] - f[4][threadIdx.y][threadIdx.x] + feq_f4(rho, 0.0, 0.0) - feq_f2(rho, 0.0, 0.0)) + (1.0 - 0.5 * wf) * dt * Force_f4(ux, uy, tem_dev[k]);
+
+  f_post_dev[k + 1 +   NX2 + 5 * NXNY2] = (1.0 - (1.0 - B) * wf) * f[5][threadIdx.y][threadIdx.x] + (1.0 - B) * wf * feq_f5(rho, ux, uy) + B * (f[7][threadIdx.y][threadIdx.x] - f[5][threadIdx.y][threadIdx.x] + feq_f5(rho, 0.0, 0.0) - feq_f7(rho, 0.0, 0.0)) + (1.0 - 0.5 * wf) * dt * Force_f5(ux, uy, tem_dev[k]);
+  f_post_dev[k - 1 +   NX2 + 6 * NXNY2] = (1.0 - (1.0 - B) * wf) * f[6][threadIdx.y][threadIdx.x] + (1.0 - B) * wf * feq_f6(rho, ux, uy) + B * (f[8][threadIdx.y][threadIdx.x] - f[6][threadIdx.y][threadIdx.x] + feq_f6(rho, 0.0, 0.0) - feq_f8(rho, 0.0, 0.0)) + (1.0 - 0.5 * wf) * dt * Force_f6(ux, uy, tem_dev[k]);
+  f_post_dev[k - 1 -   NX2 + 7 * NXNY2] = (1.0 - (1.0 - B) * wf) * f[7][threadIdx.y][threadIdx.x] + (1.0 - B) * wf * feq_f7(rho, ux, uy) + B * (f[5][threadIdx.y][threadIdx.x] - f[7][threadIdx.y][threadIdx.x] + feq_f7(rho, 0.0, 0.0) - feq_f5(rho, 0.0, 0.0)) + (1.0 - 0.5 * wf) * dt * Force_f7(ux, uy, tem_dev[k]);
+  f_post_dev[k + 1 -   NX2 + 8 * NXNY2] = (1.0 - (1.0 - B) * wf) * f[8][threadIdx.y][threadIdx.x] + (1.0 - B) * wf * feq_f8(rho, ux, uy) + B * (f[6][threadIdx.y][threadIdx.x] - f[8][threadIdx.y][threadIdx.x] + feq_f8(rho, 0.0, 0.0) - feq_f6(rho, 0.0, 0.0)) + (1.0 - 0.5 * wf) * dt * Force_f8(ux, uy, tem_dev[k]);
+  __syncthreads();
+}
+
+
+__global__ void Evolution_enthalpy(double *g_dev, double *g_post_dev, double *f_dev, double *tem_dev, double *fl_dev,int *Interface_dev,int *flag_dev)
+{
+	int x, y, k;
+	double ux, uy,h;
+	int ThreadNeary, ThreadNearx, kNear;
+	double uxNear, uyNear, hNear;
+	__shared__ double f[Q9][BY][BX]; 
+	__shared__ double g[Q5][BY][BX]; 
+	__shared__ double local[BY][BX];
+	
+	x = N16 + blockIdx.x * BX + threadIdx.x;
+	y = 1 + blockIdx.y * BY + threadIdx.y;
+	k = NX2 * y + x;
+	
+	f[0][threadIdx.y][threadIdx.x] = f_dev[k + 0];
+	f[1][threadIdx.y][threadIdx.x] = f_dev[k + 1 * NXNY2];
+	f[2][threadIdx.y][threadIdx.x] = f_dev[k + 2 * NXNY2];
+	f[3][threadIdx.y][threadIdx.x] = f_dev[k + 3 * NXNY2];
+	f[4][threadIdx.y][threadIdx.x] = f_dev[k + 4 * NXNY2];
+	f[5][threadIdx.y][threadIdx.x] = f_dev[k + 5 * NXNY2];
+	f[6][threadIdx.y][threadIdx.x] = f_dev[k + 6 * NXNY2];
+	f[7][threadIdx.y][threadIdx.x] = f_dev[k + 7 * NXNY2];
+	f[8][threadIdx.y][threadIdx.x] = f_dev[k + 8 * NXNY2];
+
+	__syncthreads();
+	g[0][threadIdx.y][threadIdx.x]=g_dev[k + 0];
+	g[1][threadIdx.y][threadIdx.x]=g_dev[k + 1 * NXNY2];
+	g[2][threadIdx.y][threadIdx.x]=g_dev[k + 2 * NXNY2];
+	g[3][threadIdx.y][threadIdx.x]=g_dev[k + 3 * NXNY2];
+	g[4][threadIdx.y][threadIdx.x]=g_dev[k + 4 * NXNY2];
+	__syncthreads();
+	
+	h=CalculateH(threadIdx.y,threadIdx.x);
+	__syncthreads();
+	fl_dev[k]=(h-Hs)/(Hl-Hs);
+	if(h<=Hs){fl_dev[k]=0.0;}
+	if(h>=Hl){fl_dev[k]=1.0;}
+	__syncthreads();
+	tem_dev[k]=(Hl-h) * Ts/(Hl-Hs) + (h-Hs) * Tl/(Hl-Hs);
+	
+	if(h<=Hs)
+    {
+        tem_dev[k]=Ts-(Hs-h)/Cp_s0;
+    }
+	if(h>=Hl)
+	{
+		tem_dev[k]=Tl + (h-Hl)/Cp_f0;
+	}
+	__syncthreads();
+
+	if(x == N16||x == NX + N16-1||y == 1||y == NY)
+	{
+		ThreadNeary = threadIdx.y;
+		ThreadNearx = threadIdx.x;	
+		ux=uy=0.0;
+		
+		if(x == N16)
+		{
+			++ThreadNearx;
+			kNear=k + 1;
+			tem_dev[k]=Thot;
+			fl_dev[k]=1.0;
+			h=Cp(fl_dev[k]) * Thot + fl_dev[k] * L;
+		}
+		if(x == NX + N16-1)
+		{
+			--ThreadNearx;
+			kNear=k-1;
+			tem_dev[k]=Tcold;
+			fl_dev[k]=0.0;
+			h=Cp(fl_dev[k]) * Tcold + fl_dev[k] * L;
+		}
+
+		if(y == 1)
+		{
+			++ThreadNeary;
+			kNear=k + NX2;
+			h=CalculateH(ThreadNeary,ThreadNearx);
+			tem_dev[k]=(Hl-h) * Ts/(Hl-Hs) + (h-Hs) * Tl/(Hl-Hs);
+	
+			if(h<=Hs){tem_dev[k]=Ts-(Hs-h)/Cp_s0;}
+			if(h>=Hl){tem_dev[k]=Tl + (h-Hl)/Cp_f0;}
+		}
+		
+		if(y == NY)
+		{
+			--ThreadNeary;
+			kNear=k-NX2;
+			
+			h=CalculateH(ThreadNeary,ThreadNearx);
+			tem_dev[k]=(Hl-h) * Ts/(Hl-Hs) + (h-Hs) * Tl/(Hl-Hs);
+	
+			if(h<=Hs){tem_dev[k]=Ts-(Hs-h)/Cp_s0;}
+			if(h>=Hl){tem_dev[k]=Tl + (h-Hl)/Cp_f0;}
+		}
+				
+		uxNear=CalculateUx(ThreadNeary,ThreadNearx);
+		uyNear=CalculateUy(ThreadNeary,ThreadNearx) + 0.5 * g_beta * (tem_dev[kNear] - Tref) * dt;
+		hNear=CalculateH(ThreadNeary,ThreadNearx);
+				
+		g[0][threadIdx.y][threadIdx.x]=feq_h0(fl_dev[k],h,tem_dev[k],ux,uy) + g[0][ThreadNeary][ThreadNearx]-feq_h0(fl_dev[kNear],hNear,tem_dev[kNear],uxNear,uyNear);
+		g[1][threadIdx.y][threadIdx.x]=feq_h1(fl_dev[k],h,tem_dev[k],ux,uy) + g[1][ThreadNeary][ThreadNearx]-feq_h1(fl_dev[kNear],hNear,tem_dev[kNear],uxNear,uyNear);
+		g[2][threadIdx.y][threadIdx.x]=feq_h2(fl_dev[k],h,tem_dev[k],ux,uy) + g[2][ThreadNeary][ThreadNearx]-feq_h2(fl_dev[kNear],hNear,tem_dev[kNear],uxNear,uyNear);
+		g[3][threadIdx.y][threadIdx.x]=feq_h3(fl_dev[k],h,tem_dev[k],ux,uy) + g[3][ThreadNeary][ThreadNearx]-feq_h3(fl_dev[kNear],hNear,tem_dev[kNear],uxNear,uyNear);
+		g[4][threadIdx.y][threadIdx.x]=feq_h4(fl_dev[k],h,tem_dev[k],ux,uy) + g[4][ThreadNeary][ThreadNearx]-feq_h4(fl_dev[kNear],hNear,tem_dev[kNear],uxNear,uyNear);				
+	}
+	
+	ux=CalculateUx(threadIdx.y,threadIdx.x);
+    uy=CalculateUy(threadIdx.y,threadIdx.x) + 0.5 * g_beta * (tem_dev[k] - Tref) * dt;
+    __syncthreads();
+    
+    local[threadIdx.y][threadIdx.x] = flag_dev[k];
+    if (local[threadIdx.y][threadIdx.x] == 0) 
+    {
+        local[threadIdx.y][threadIdx.x] = fl_dev[k];
+    }
+
+	if(x == N16||x == NX + N16-1||y == 1||y == NY||fl_dev[k] == 0.0)
+	{ux=uy=0.0;}
+    __syncthreads();
+
+	g_post_dev[k +          0] = g[0][threadIdx.y][threadIdx.x] + wa(tem_dev[k],local[threadIdx.y][threadIdx.x]) * (feq_h0(local[threadIdx.y][threadIdx.x],h,tem_dev[k],ux,uy) - g[0][threadIdx.y][threadIdx.x]) + ws(tem_dev[k],local[threadIdx.y][threadIdx.x]) * (feq_h0(local[threadIdx.y][threadIdx.x],h,tem_dev[k],ux,uy) - g[0][threadIdx.y][threadIdx.x]);
+	g_post_dev[k + 1  +1 * NXNY2] = g[1][threadIdx.y][threadIdx.x] + wa(tem_dev[k],local[threadIdx.y][threadIdx.x]) * (feq_h1(local[threadIdx.y][threadIdx.x],h,tem_dev[k],ux,uy) - g[1][threadIdx.y][threadIdx.x]) + ws(tem_dev[k],local[threadIdx.y][threadIdx.x]) * (feq_h3(local[threadIdx.y][threadIdx.x],h,tem_dev[k],ux,uy) - g[3][threadIdx.y][threadIdx.x]);
+	g_post_dev[k + NX2 + 2*NXNY2] = g[2][threadIdx.y][threadIdx.x] + wa(tem_dev[k],local[threadIdx.y][threadIdx.x]) * (feq_h2(local[threadIdx.y][threadIdx.x],h,tem_dev[k],ux,uy) - g[2][threadIdx.y][threadIdx.x]) + ws(tem_dev[k],local[threadIdx.y][threadIdx.x]) * (feq_h4(local[threadIdx.y][threadIdx.x],h,tem_dev[k],ux,uy) - g[4][threadIdx.y][threadIdx.x]);
+	g_post_dev[k -1  +3 * NXNY2] = g[3][threadIdx.y][threadIdx.x] + wa(tem_dev[k],local[threadIdx.y][threadIdx.x]) * (feq_h3(local[threadIdx.y][threadIdx.x],h,tem_dev[k],ux,uy) - g[3][threadIdx.y][threadIdx.x]) + ws(tem_dev[k],local[threadIdx.y][threadIdx.x]) * (feq_h1(local[threadIdx.y][threadIdx.x],h,tem_dev[k],ux,uy) - g[1][threadIdx.y][threadIdx.x]);
+	g_post_dev[k -NX2 + 4 * NXNY2] = g[4][threadIdx.y][threadIdx.x] + wa(tem_dev[k],local[threadIdx.y][threadIdx.x]) * (feq_h4(local[threadIdx.y][threadIdx.x],h,tem_dev[k],ux,uy) - g[4][threadIdx.y][threadIdx.x]) + ws(tem_dev[k],local[threadIdx.y][threadIdx.x]) * (feq_h2(local[threadIdx.y][threadIdx.x],h,tem_dev[k],ux,uy) - g[2][threadIdx.y][threadIdx.x]);
+	__syncthreads();
+    	
+	Interface_dev[k] = 0;
+	if (fl_dev[k] > eps&&fl_dev[k] < 1 - eps)
+	{
+		Interface_dev[k] = 1;
+	}
+	__syncthreads();	
+}
+
+void ComputNu(double Fo)
+{
+    int y;
+    for (y = 1; y <= NY; ++y)
+    {
+		Nu[y-1] = -0.5f * (-3.0f * Tem[y][N16 + 1] + 4.0f * Tem[y][N16 + 2] - Tem[y][N16 + 3])/dx;
+    }
+}
+
+double AverageNu()
+{
+	Nu_av = 0.0;
+    int y;
+    for (y = 0; y < NY-1; ++y)
+    {
+        Nu_av += Nu[y] * dx;
+    }
+	return (Nu_av);
+}
+
+double Computfl()
+{
+	int x,y;
+	fl_av=0.0;
+    IF_area = 0;
+    sensheat=0.0, latheat= 0.0,heat= 0.0;
+	for(y=1;y<=NY;++y)
+	{
+		for(x=N16;x<=NX + N16-1;++x)
+		{
+			if(Flag[y][x] == -1||Flag[y][x] == 2||Flag[y][x] == 3){Fl[y][x]=0;}
+			fl_av += Fl[y][x];
+			IF_area  +=  Interface[y][x];
+            if (Flag[y][x] == 0)
+            {
+                sensheat += Cp_f0 * Tem[y][x];
+                latheat += Fl[y][x] * L;
+            }
+		}
+	}
+	fl_av=fl_av/num;
+    heat = latheat + sensheat;
+	return(fl_av);	
+}
+
+void compute_and_save_quantities_to_file(double Fo)
+{
+	int y, x;
+	double ux,uy,rho;
+	FILE *fp;
+	//FILE *fpp;
+	char filenamea[30];
+	//char filenameb[30];
+	sprintf(filenamea, "%s%f%s", "Result", Fo, ".dat");
+	//sprintf(filenameb, "%s%f%s", "Tem", Fo, ".txt");
+	fp = fopen(filenamea, "w");
+	//fpp = fopen(filenameb, "w");
+	fprintf(fp, " Title=\"2DMelting\" \n");
+	fprintf(fp, " variables=\"x\",\"y\",\"UX\",\"UY\",\"U\",\"rho\",\"Tem\",\"Fl\",\"Interface\",\"RlxTime\",\"flag\" \n");
+	fprintf(fp, " ZONE T = \"BOX\",I = %d,J= %d, F = POINT\n", NX, NY);
+	for (y = 1; y <= NY; y += 1)
+	{
+		/*
+		if(y == (NY/2-1))
+		{
+			for(x = N16; x < NX + N16; x += 1)
+			{
+				fprintf(fpp,"%d\t%e\t\n", x, Tem[y][x]);
+			}
+		}
+		*/
+		for (x = N16; x < NX + N16; x += 1)
+		{
+			
+			ux=CalculateUx(y,x);
+			uy=CalculateUy(y,x) + 0.5 * g_beta * (Tem[y][x] - Tref) * dt;
+			rho=RHO(y,x);			
+			if(x == N16||x == NX + N16-1||y == 1||y == NY){ux=uy=0.0;}
+			if(Fl[y][x] == 0.0){ux=uy=0.0;}
+			fprintf(fp, "%d\t %d\t  %e\t %e\t %e\t  %e\t  %e\t  %e\t %d\t %e\t %d\t \n", x, y, ux, uy, sqrt(ux * ux + uy * uy), rho, Tem[y][x], Fl[y][x], Interface[y][x],RlxTime[y][x],Flag[y][x]);
+			
+		}
+	}
+		fclose(fp);
+		//fclose(fpp);
+}
+
+int main(void)
+{
+	cudaSetDevice(0);
+	dim3 threads(BX, BY);
+	dim3 grid(NX / BX, NY / BY);
+	clock_t first, second;
+	int t;
+	
+	FILE *fpp;
+	fpp = fopen("Average_Nu", "w");
+	
+	cudaMalloc((void**)&f_dev, sizeof(double) * Q9 * NY2 * NX2);
+	cudaMalloc((void**)&f_post_dev, sizeof(double) * Q9 * NY2 * NX2);
+	
+	cudaMalloc((void**)&g_dev, sizeof(double) * Q5 * NY2 * NX2);
+	cudaMalloc((void**)&g_post_dev, sizeof(double) * Q5 * NY2 * NX2);	
+	cudaMalloc((void**)&tem_dev, sizeof(double) * NY2 * NX2);
+	cudaMalloc((void**)&fl_dev, sizeof(double) * NY2 * NX2);
+	cudaMalloc((void**)&Interface_dev, sizeof(int) * NY2 * NX2);
+	cudaMalloc((void**)&flag_dev,sizeof(int) * NY2 * NX2);
+    cudaMalloc((void**)&RlxTime_dev, sizeof(double) * NY2 * NX2);
+	flag();
+	LB_init();
+	Parameters_file();
+	cudaMemcpy(f_dev, &f[0][0][0], sizeof(double) * NY2 * NX2 * Q9, cudaMemcpyHostToDevice);
+	cudaMemcpy(f_post_dev, &f[0][0][0], sizeof(double) * NY2 * NX2 * Q9, cudaMemcpyHostToDevice);
+
+	cudaMemcpy(g_dev, &g[0][0][0], sizeof(double) * NY2 * NX2 * Q5, cudaMemcpyHostToDevice);
+	cudaMemcpy(g_post_dev, &g[0][0][0], sizeof(double) * NY2 * NX2 * Q5, cudaMemcpyHostToDevice);	
+	cudaMemcpy(tem_dev, &Tem[0][0], sizeof(double) * NY2 * NX2, cudaMemcpyHostToDevice);
+	cudaMemcpy(fl_dev, &Fl[0][0], sizeof(double) * NY2 * NX2, cudaMemcpyHostToDevice);
+	cudaMemcpy(Interface_dev, &Interface[0][0], sizeof(int) * NY2 * NX2, cudaMemcpyHostToDevice);
+	cudaMemcpy(flag_dev, &Flag[0][0], sizeof(int) * NY2 * NX2, cudaMemcpyHostToDevice);
+  cudaMemcpy(RlxTime_dev, &RlxTime[0][0], sizeof(double) * NY2 * NX2, cudaMemcpyHostToDevice);
+
+	first = clock();
+	t = 0;
+	
+	cudaMemcpy(&f[0][0][0], f_dev, sizeof(double) * NY2 * NX2 * Q9, cudaMemcpyDeviceToHost);
+	cudaMemcpy(&Tem[0][0], tem_dev, sizeof(double) * NY2 * NX2, cudaMemcpyDeviceToHost);
+			
+	cudaMemcpy(&Fl[0][0], fl_dev, sizeof(double) * NY2 * NX2, cudaMemcpyDeviceToHost);
+	cudaMemcpy(&Interface[0][0], Interface_dev, sizeof(int) * NY2 * NX2, cudaMemcpyDeviceToHost);
+
+  ComputNu(undim_t*double(t));
+  Computfl();
+  AverageNu();
+  printf("%f\t%f\t%d\t%f\n", undim_t * float(t),fl_av, IF_area, Nu_av);         
+  fprintf(fpp,"%f\t%f\t%d\t%f\t%f\t%f\t%f\n", undim_t * float(t),fl_av, IF_area, Nu_av, sensheat, latheat, heat);
+	
+	compute_and_save_quantities_to_file(double(t) * undim_t);
+
+	for (t = 2; t <= tmax; t += 2)
+	{
+		Evolution_flow << <grid, threads >> > (f_dev, f_post_dev, tem_dev, fl_dev ,flag_dev, RlxTime_dev);
+		Evolution_enthalpy << <grid, threads >> > (g_dev, g_post_dev, f_post_dev, tem_dev, fl_dev, Interface_dev ,flag_dev);
+		
+		Evolution_flow << <grid, threads >> > (f_post_dev, f_dev, tem_dev, fl_dev ,flag_dev, RlxTime_dev);
+		Evolution_enthalpy << <grid, threads >> > (g_post_dev, g_dev, f_dev, tem_dev, fl_dev, Interface_dev ,flag_dev);
+		
+		if (t % 5000 == 0)
+		{
+			cudaMemcpy(&f[0][0][0], f_dev, sizeof(double) * NY2 * NX2 * Q9, cudaMemcpyDeviceToHost);
+			cudaMemcpy(&Tem[0][0], tem_dev, sizeof(double) * NY2 * NX2, cudaMemcpyDeviceToHost);
+			cudaMemcpy(&RlxTime[0][0],RlxTime_dev, sizeof(double) * NY2 * NX2, cudaMemcpyDeviceToHost);
+			cudaMemcpy(&Fl[0][0], fl_dev, sizeof(double)* NY2 * NX2, cudaMemcpyDeviceToHost);
+			cudaMemcpy(&Interface[0][0], Interface_dev, sizeof(int) * NY2 * NX2, cudaMemcpyDeviceToHost);
+			ComputNu(undim_t * double(t));
+            Computfl();
+            AverageNu();
+			printf("%f\t%f\t%d\t%f\n", undim_t * float(t),fl_av, IF_area, Nu_av);			
+			fprintf(fpp,"%f\t%f\t%d\t%f\t%f\t%f\t%f\t%f\n", undim_t * float(t),fl_av, IF_area, Nu_av, sensheat, latheat, heat, Ste_f * undim_t * float(t));
+			if (t % 100000 == 0)
+			{				
+				compute_and_save_quantities_to_file(undim_t * double(t));			
+			}
+			if(IF_area == 0.0)
+			{
+				compute_and_save_quantities_to_file(undim_t * double(t));
+				break;
+			}
+		}
+	}
+	fclose(fpp);
+	second = clock();
+	printf("The computing time is: %f seconds\n", (float)(second - first) / CLOCKS_PER_SEC);
+
+	cudaFree(f_dev);
+	cudaFree(f_post_dev);
+	cudaFree(g_dev);
+	cudaFree(g_post_dev);
+	cudaFree(RlxTime_dev);
+	cudaFree(tem_dev);
+	cudaFree(fl_dev);
+	cudaFree(Interface_dev);
+	cudaFree(flag_dev);
+	printf("ending !!!!!!");
+	getchar();
+}
+
