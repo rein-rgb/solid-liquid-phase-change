@@ -368,9 +368,9 @@ __global__ void Evolution_flow(double *f_dev, double *f_post_dev, double *tem_de
   TAU = RlxTime[threadIdx.y][threadIdx.x];
 
   Cxx = f[1][threadIdx.y][threadIdx.x] + f[3][threadIdx.y][threadIdx.x] + f[5][threadIdx.y][threadIdx.x] + f[6][threadIdx.y][threadIdx.x] + f[7][threadIdx.y][threadIdx.x] + f[8][threadIdx.y][threadIdx.x]-(feq_f1(rho,ux,uy) + feq_f3(rho,ux,uy) + feq_f5(rho,ux,uy) + feq_f6(rho,ux,uy) + feq_f7(rho,ux,uy) + feq_f8(rho,ux,uy)) + 0.5 * dt * rho * (Fx(tem_dev[k]) * ux + ux * Fx(tem_dev[k]))/(c * c);
-  Cxy = f[5][threadIdx.y][threadIdx.x]-f[6][threadIdx.y][threadIdx.x] + f[7][threadIdx.y][threadIdx.x]-f[8][threadIdx.y][threadIdx.x]
+  Cxy = f[5][threadIdx.y][threadIdx.x] - f[6][threadIdx.y][threadIdx.x] + f[7][threadIdx.y][threadIdx.x]-f[8][threadIdx.y][threadIdx.x]
   -(feq_f5(rho,ux,uy)-feq_f6(rho,ux,uy) + feq_f7(rho,ux,uy)-feq_f8(rho,ux,uy)) + 0.5 * dt * rho * (Fx(tem_dev[k]) * uy + ux * Fy(tem_dev[k]))/(c * c);
-  Cyx = f[5][threadIdx.y][threadIdx.x]-f[6][threadIdx.y][threadIdx.x] + f[7][threadIdx.y][threadIdx.x]-f[8][threadIdx.y][threadIdx.x]
+  Cyx = f[5][threadIdx.y][threadIdx.x] - f[6][threadIdx.y][threadIdx.x] + f[7][threadIdx.y][threadIdx.x]-f[8][threadIdx.y][threadIdx.x]
   -(feq_f5(rho,ux,uy)-feq_f6(rho,ux,uy) + feq_f7(rho,ux,uy)-feq_f8(rho,ux,uy)) + 0.5 * dt * rho * (Fy(tem_dev[k]) * ux + uy * Fx(tem_dev[k]))/(c * c);
   Cyy = f[2][threadIdx.y][threadIdx.x] + f[4][threadIdx.y][threadIdx.x] + f[5][threadIdx.y][threadIdx.x] + f[6][threadIdx.y][threadIdx.x] + f[7][threadIdx.y][threadIdx.x] + f[8][threadIdx.y][threadIdx.x]-(feq_f2(rho,ux,uy) + feq_f4(rho,ux,uy) + feq_f5(rho,ux,uy) + feq_f6(rho,ux,uy) + feq_f7(rho,ux,uy) + feq_f8(rho,ux,uy)) + 0.5 * dt * rho * (Fy(tem_dev[k]) * uy + uy * Fy(tem_dev[k]))/(c * c);
 
